@@ -56,32 +56,103 @@ use crate::{
     runc::{RuncContainer, RuncFactory},
 };
 
-pub fn fork_task_server(task_socket: &str, sandbox_parent_dir: &str) -> Result<(), anyhow::Error> {
-    prepare_unix_socket(task_socket)?;
+use std::net::{SocketAddr, TcpListener, TcpStream};
+use nix::unistd::dup;
 
-    let task_listener = UnixListener::bind(task_socket)?;
-    let (pipe_r, pipe_w) = pipe().map_err(|e| anyhow!("failed to create pipe {}", e))?;
-    match unsafe { fork().map_err(|e| anyhow!("failed to fork task service {}", e))? } {
-        ForkResult::Parent { child: _ } => {
-            drop(pipe_r);
-            drop(task_listener);
-            forget(pipe_w);
-            Ok(())
+pub fn fork_task_server(task_socket: &str, sandbox_parent_dir: &str) -> Result<(), anyhow::Error> {
+    //prepare_unix_socket(task_socket)?;
+
+        println!("Path: {:?}", task_socket);
+
+    if task_socket.starts_with("tcp://") {
+        //let addr = &task_socket[6..]; // Remove "tcp://" prefix
+        //let task_listener = TcpListener::bind(addr)?;
+        let (pipe_r, pipe_w) = pipe().map_err(|e| anyhow!("failed to create pipe {}", e))?;
+        match unsafe { fork().map_err(|e| anyhow!("failed to fork task service {}", e))? } {
+            ForkResult::Parent { child: _ } => {
+                drop(pipe_r);
+                forget(pipe_w);
+                Ok(())
+            }
+            ForkResult::Child => {
+                drop(pipe_w);
+                prctl::set_child_subreaper(true).unwrap();
+                // TODO set thread count
+                let runtime = tokio::runtime::Runtime::new().unwrap();
+                runtime.block_on(async move {
+                    if let Err(e) = run_tcp_task_server(task_socket, pipe_r, sandbox_parent_dir).await {
+                        error!("run task server failed {}", e);
+                        exit(-1);
+                    }
+                });
+                exit(0);
+            }
         }
-        ForkResult::Child => {
-            drop(pipe_w);
-            prctl::set_child_subreaper(true).unwrap();
-            // TODO set thread count
-            let runtime = tokio::runtime::Runtime::new().unwrap();
-            runtime.block_on(async move {
-                if let Err(e) = run_task_server(task_listener, pipe_r, sandbox_parent_dir).await {
-                    error!("run task server failed {}", e);
-                    exit(-1);
-                }
-            });
-            exit(0);
-        }
+    } else {
+        let task_listener = UnixListener::bind(task_socket)?;
+        let (pipe_r, pipe_w) = pipe().map_err(|e| anyhow!("failed to create pipe {}", e))?;
+        match unsafe { fork().map_err(|e| anyhow!("failed to fork task service {}", e))? } {
+            ForkResult::Parent { child: _ } => {
+                drop(pipe_r);
+                drop(task_listener);
+                forget(pipe_w);
+                Ok(())
+            }
+            ForkResult::Child => {
+                drop(pipe_w);
+                prctl::set_child_subreaper(true).unwrap();
+                // TODO set thread count
+                let runtime = tokio::runtime::Runtime::new().unwrap();
+                runtime.block_on(async move {
+                    if let Err(e) = run_task_server(task_listener, pipe_r, sandbox_parent_dir).await {
+                        error!("run task server failed {}", e);
+                        exit(-1);
+                    }
+                });
+                exit(0);
+            }
+        } 
     }
+
+}
+
+async fn run_tcp_task_server(
+    task_socket: &str,
+    exit_pipe: OwnedFd,
+    sandbox_parent_dir: &str,
+) -> error::Result<()> {
+    let task = start_task_service(sandbox_parent_dir).await?;
+    let containers = task.containers.clone();
+    let task_service: HashMap<String, containerd_shim::protos::ttrpc::asynchronous::Service> =
+        create_task(Arc::new(Box::new(task)));
+
+    let mut server = Server::new().register_service(task_service);
+    server = server
+        .bind(task_socket)
+        .map_err(|e| anyhow!("failed to add listener to server {:?}", e))?;
+    server = server.set_domain_tcp();
+
+    server
+        .start()
+        .await
+        .map_err(|e| anyhow!("failed to start task server, {}", e))?;
+    // wait parent exit
+    asyncify(move || Ok(read_count(exit_pipe.as_raw_fd(), 1).unwrap_or_default()))
+        .await
+        .unwrap_or_default();
+
+    // after parent exit, wait exit_signal so that if all containers is removed, we can exit.
+    loop {
+        if containers.lock().await.is_empty() {
+            break;
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+    server
+        .shutdown()
+        .await
+        .map_err(|e| anyhow!("failed to shutdown task server {}", e))?;
+    Ok(())
 }
 
 async fn run_task_server(

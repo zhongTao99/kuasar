@@ -74,8 +74,10 @@ fn main() {
 
     let sandbox_parent = fork_sandbox_parent().unwrap();
 
-    let task_socket = format!("{}/task-{}.sock", &args.dir, Uuid::new_v4());
-    fork_task_server(&task_socket, &args.dir).unwrap();
+    let task_socket = "192.168.0.6:9090".to_string();
+    let tcp_task_sock = "tcp://192.168.0.6:9090".to_string();
+    //let task_socket = format!("{}/task-{}.sock", &args.dir, Uuid::new_v4());
+    fork_task_server(&tcp_task_sock, &args.dir).unwrap();
     let runtime = tokio::runtime::Runtime::new().unwrap();
     runtime.block_on(async move {
         start_sandboxer(sandbox_parent, task_socket, &args.listen, &args.dir)
@@ -264,7 +266,8 @@ async fn start_sandboxer(
     listen: &str,
     dir: &str,
 ) -> anyhow::Result<()> {
-    let task_address = format!("unix://{}", task_socket);
+    let task_address = format!("tcp://{}", task_socket);
+    //let task_address = format!("unix://{}", task_socket);
     let sandboxer = RuncSandboxer::new(sandbox_parent, &task_address).await?;
     sandboxer.recover(dir).await?;
     containerd_sandbox::run("kuasar-runc-sandboxer", listen, dir, sandboxer).await?;
